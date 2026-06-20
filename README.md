@@ -10,7 +10,7 @@ If you have your own server, just replace ```insta.stick.moe``` with your own! I
 ## Installing
 Git clone the repo. ```git clone https://github.com/NotNotEnder/basic-instagram-embed-proxy```
 
-Install Node.js dependencies. ```npm install``` or use whatever your favourite is lol, idc.
+Install Node.js dependencies. ```npm install``` or use whatever your favourite is lol, idc. And update it too!!
 
 Run the server. ```node server.js```
 
