@@ -1,5 +1,5 @@
-# Instagram Embedder Proxy (For Reels)
-This app will take any reel and make it embeddable! All you have to do is replace the "instagram.com" with wherever your server is (or you can use mine!).
+# Instagram Embed Proxy (For Reels)
+This app will take any reel and make it an embed! All you have to do is replace the "instagram.com" with wherever your server is (or you can use mine!).
 
 ## Example
 ```https://instagram.com/reel/something-really-profound``` to
