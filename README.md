@@ -8,7 +8,7 @@ This app will take any reel and make it an embed! All you have to do is replace 
 If you have your own server, just replace ```insta.stick.moe``` with your own! If the URL is a ```/reels/``` URL... it auto-resolves too!
 
 ## Installing
-Git clone the repo. ```git clone https://github.com/NotNotEnder/basic-instagram-embedder.git```
+Git clone the repo. ```git clone https://github.com/NotNotEnder/basic-instagram-embed-proxy```
 
 Install Node.js dependencies. ```npm install``` or use whatever your favourite is lol, idc.
 
