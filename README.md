@@ -12,6 +12,8 @@ Git clone the repo. ```git clone https://github.com/NotNotEnder/basic-instagram-
 
 Install Node.js dependencies. ```npm install``` or use whatever your favourite is lol, idc. And update it too!!
 
+Make your .env. This needs to have an account cookie for it to work now! Instagram changed some stuff and now it won't auth without it. Set it with ```IG_COOKIE="sessionid=X; csrftoken=X"```.
+
 Run the server. ```node server.js```
 
 That's it!

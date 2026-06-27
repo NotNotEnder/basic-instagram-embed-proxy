@@ -1,5 +1,36 @@
+const fs = require("fs");
+const path = require("path");
 const express = require("express");
 const { Readable } = require("stream");
+
+// Load a local .env into process.env before anything reads it. pm2 does not load
+// .env files on its own, and we want config (IG_COOKIE, etc.) to work without a
+// dependency. Real environment variables take precedence, so pm2 ecosystem env
+// or shell exports still override the file.
+function loadDotEnv(envPath = path.join(__dirname, ".env")) {
+  let raw;
+  try {
+    raw = fs.readFileSync(envPath, "utf8");
+  } catch {
+    return; // No .env file is fine.
+  }
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eq = trimmed.indexOf("=");
+    if (eq < 1) continue;
+    const key = trimmed.slice(0, eq).trim();
+    if (key in process.env) continue; // Don't clobber real env.
+    let value = trimmed.slice(eq + 1).trim();
+    // Strip a single layer of matching surrounding quotes.
+    if (value.length >= 2 && /^(".*"|'.*')$/s.test(value)) {
+      value = value.slice(1, -1);
+    }
+    process.env[key] = value;
+  }
+}
+
+loadDotEnv();
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -8,6 +39,21 @@ const BOT_UA =
   "Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)";
 const CACHE_MS = Number(process.env.CACHE_MS || 5 * 60 * 1000);
 const cache = new Map();
+
+// Account whose session powers the scraper. Shown on the rendered page only (not
+// in the embed meta tags). Set IG_CREDIT_URL="" to hide it.
+const CREDIT_URL =
+  process.env.IG_CREDIT_URL ?? "https://www.instagram.com/insta.stick.moe/";
+const CREDIT_TEXT =
+  process.env.IG_CREDIT_TEXT ||
+  "Support the scraper bot so it doesn't get banned";
+
+function renderCreditHtml() {
+  if (!CREDIT_URL) return "";
+  return `<div class="meta">${htmlEscape(CREDIT_TEXT)}: <a href="${htmlEscape(
+    CREDIT_URL
+  )}" rel="noreferrer">${htmlEscape(CREDIT_URL)}</a></div>`;
+}
 
 function htmlEscape(value) {
   return String(value ?? "")
@@ -273,12 +319,138 @@ const IG_WEB_UA =
 // Overridable via env in case Instagram rotates it.
 const IG_POST_DOC_ID = process.env.IG_POST_DOC_ID || "8845758582119845";
 
+// Optional authenticated cookie string (e.g. "sessionid=...; csrftoken=...").
+// Logged-out csrftokens work from residential IPs, but Instagram returns 401 for
+// GraphQL requests from datacenter/VPS IPs unless a real session is supplied.
+// Get these from a browser logged into instagram.com (DevTools > Application >
+// Cookies). Treat IG_COOKIE as a secret: it grants account access. Never commit it.
+const IG_COOKIE = (process.env.IG_COOKIE || "").trim();
+
+function parseCookieValue(cookieString, name) {
+  const m = cookieString.match(new RegExp(`(?:^|;\\s*)${name}=([^;]+)`));
+  return m ? m[1] : "";
+}
+
+function mergeCookieStrings(base, extra) {
+  const map = new Map();
+  for (const part of `${base}; ${extra}`.split(";")) {
+    const trimmed = part.trim();
+    if (!trimmed) continue;
+    const eq = trimmed.indexOf("=");
+    if (eq < 1) continue;
+    // `extra` is appended after `base`, so it overwrites duplicate keys.
+    map.set(trimmed.slice(0, eq), trimmed.slice(eq + 1));
+  }
+  return [...map].map(([k, v]) => `${k}=${v}`).join("; ");
+}
+
 function extractInstaAuth(res) {
-  const jar =
-    typeof res.headers.getSetCookie === "function" ? res.headers.getSetCookie() : [];
-  const cookie = jar.map((c) => c.split(";")[0]).join("; ");
-  const csrf = (cookie.match(/csrftoken=([^;]+)/) || [])[1] || "";
+  // `Headers.getSetCookie()` only exists on Node >= 18.14 / 20+. On older Node it
+  // is undefined, so fall back to the combined `set-cookie` header. We only need
+  // the single `csrftoken` cookie, so the comma-join caveat of `.get()` is moot.
+  let jar = [];
+  if (typeof res.headers.getSetCookie === "function") {
+    jar = res.headers.getSetCookie();
+  } else {
+    const raw = res.headers.get("set-cookie");
+    if (raw) jar = [raw];
+  }
+  let cookie = jar.map((c) => c.split(";")[0]).join("; ");
+
+  // Layer the configured session cookie on top of the freshly minted one. The
+  // sessionid is what gets us past the datacenter-IP 401.
+  if (IG_COOKIE) cookie = mergeCookieStrings(cookie, IG_COOKIE);
+
+  // The private API also needs `ds_user_id`; without it the media-info endpoint
+  // 302-redirects to itself in a loop (surfaces as "fetch failed"). The user id is
+  // the first ":"-separated field of the (url-encoded) sessionid, so derive it
+  // rather than requiring the operator to copy a second cookie.
+  if (parseCookieValue(cookie, "sessionid") && !parseCookieValue(cookie, "ds_user_id")) {
+    const dsUserId = decodeURIComponent(parseCookieValue(cookie, "sessionid")).split(":")[0];
+    if (dsUserId) cookie = mergeCookieStrings(cookie, `ds_user_id=${dsUserId}`);
+  }
+
+  // X-CSRFToken must match the csrftoken cookie we send. Prefer the one bundled
+  // with the configured session so the pair stays consistent.
+  const csrf =
+    parseCookieValue(IG_COOKIE, "csrftoken") || parseCookieValue(cookie, "csrftoken");
   return { cookie, csrf };
+}
+
+// Instagram shortcodes are a base64 encoding (custom alphabet) of the numeric
+// media primary key. Decoding it locally lets us call the media-info API without
+// a doc_id, which Instagram rotates and periodically retires.
+const IG_SHORTCODE_ALPHABET =
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+function shortcodeToMediaPk(shortcode) {
+  let pk = 0n;
+  for (const ch of shortcode) {
+    const index = IG_SHORTCODE_ALPHABET.indexOf(ch);
+    if (index < 0) throw new Error(`Invalid shortcode character: ${ch}`);
+    pk = pk * 64n + BigInt(index);
+  }
+  return pk.toString();
+}
+
+// Authenticated private API. Unlike the GraphQL persisted query, this has no
+// doc_id to rotate, and it returns media even from datacenter IPs as long as a
+// valid session cookie (IG_COOKIE) is supplied. Logged-out it serves an HTML
+// login wall, which we reject so the caller can fall back.
+async function tryFetchFromMediaInfo(shortcode, auth) {
+  const { cookie, csrf } = auth || {};
+  if (!cookie) throw new Error("Missing Instagram session cookies for media info");
+
+  const pk = shortcodeToMediaPk(shortcode);
+  const res = await fetch(`https://www.instagram.com/api/v1/media/${pk}/info/`, {
+    // Use manual redirects: an unauthenticated/incomplete session makes this
+    // endpoint 302 to itself, which "follow" turns into an opaque "fetch failed".
+    redirect: "manual",
+    headers: {
+      "User-Agent": IG_WEB_UA,
+      "X-IG-App-ID": IG_APP_ID,
+      "X-CSRFToken": csrf,
+      "X-IG-WWW-Claim": "0",
+      Accept: "application/json",
+      Cookie: cookie
+    }
+  });
+
+  if (res.status >= 300 && res.status < 400) {
+    throw new Error("Media info endpoint redirected (session invalid or expired)");
+  }
+  if (!res.ok) {
+    throw new Error(`Media info endpoint returned ${res.status}`);
+  }
+  if (!/application\/json/i.test(res.headers.get("content-type") || "")) {
+    // Logged-out / challenged requests get an HTML page instead of JSON.
+    throw new Error("Media info endpoint did not return JSON (session required)");
+  }
+
+  const json = await res.json();
+  const media = json?.items?.[0] || null;
+  if (!media) {
+    throw new Error("Media info response did not contain media");
+  }
+
+  const mediaItems = extractMediaItems(media);
+  if (!mediaItems.length) {
+    throw new Error("Media info response did not include supported media");
+  }
+
+  const primaryMedia = mediaItems[0];
+
+  return {
+    mediaItems,
+    title: media.title || media.accessibility_caption || "Instagram video",
+    description:
+      media.caption?.text ||
+      media.edge_media_to_caption?.edges?.[0]?.node?.text ||
+      "Instagram video proxy embed",
+    image: primaryMedia.posterUrl || null,
+    width: String(primaryMedia.width || 720),
+    height: String(primaryMedia.height || 1280)
+  };
 }
 
 async function tryFetchFromGraphql(shortcode, auth) {
@@ -394,24 +566,39 @@ async function fetchInstaEmbedData(type, shortcode) {
     ];
   }
 
-  try {
-    const jsonData = await tryFetchFromGraphql(shortcode, auth);
-    const jsonHasPlayableVideo = jsonData.mediaItems.some((item) => item.type === "video");
-    const currentHasPlayableVideo = mediaItems.some((item) => item.type === "video");
+  // Source the rich media (video) from the API. Try the authenticated media-info
+  // endpoint first (no doc_id to rotate), then the GraphQL persisted query as a
+  // fallback. Whichever returns a playable video wins.
+  const apiFetchers = [
+    ["media-info", tryFetchFromMediaInfo],
+    ["GraphQL", tryFetchFromGraphql]
+  ];
+  for (const [label, fetcher] of apiFetchers) {
+    try {
+      const jsonData = await fetcher(shortcode, auth);
+      const jsonHasPlayableVideo = jsonData.mediaItems.some((item) => item.type === "video");
+      const currentHasPlayableVideo = mediaItems.some((item) => item.type === "video");
 
-    if (
-      jsonData.mediaItems.length &&
-      (!currentHasPlayableVideo || jsonHasPlayableVideo)
-    ) {
-      mediaItems = jsonData.mediaItems;
+      if (
+        jsonData.mediaItems.length &&
+        (!currentHasPlayableVideo || jsonHasPlayableVideo)
+      ) {
+        mediaItems = jsonData.mediaItems;
+      }
+      title = title || jsonData.title;
+      description = description || jsonData.description;
+      image = image || jsonData.image;
+      width = width || jsonData.width;
+      height = height || jsonData.height;
+
+      // Got a playable video — no need to try the next source.
+      if (mediaItems.some((item) => item.type === "video")) break;
+    } catch (err) {
+      // Don't fail the whole request if a richer source is unavailable, but log it:
+      // these are the paths that yield video, so silent failure here is exactly
+      // what makes the server fall back to a thumbnail-only embed.
+      console.warn(`${label} fetch failed for ${shortcode}: ${err.message}`);
     }
-    title = title || jsonData.title;
-    description = description || jsonData.description;
-    image = image || jsonData.image;
-    width = width || jsonData.width;
-    height = height || jsonData.height;
-  } catch (_err) {
-    // Keep the external response simple; details are mostly operational noise.
   }
 
   if (!mediaItems.length) {
@@ -499,6 +686,7 @@ function renderVideoEmbedPage(data, embedVideoUrl, options) {
         <source src="${safeVideo}" type="video/mp4" />
       </video>
       <div class="meta">Original: <a href="${safeCanonicalUrl}" rel="noreferrer">${safeCanonicalUrl}</a></div>
+      ${renderCreditHtml()}
     </div>
   </body>
 </html>`;
@@ -572,6 +760,7 @@ function renderMediaEmbedPage(data, options) {
       <div class="dots" id="dots"></div>
       <div class="count" id="count"></div>
       <div class="meta">Original: <a href="${safeCanonicalUrl}" rel="noreferrer">${safeCanonicalUrl}</a></div>
+      ${renderCreditHtml()}
     </div>
     <script id="media-data" type="application/json">${inlineCarouselJson}</script>
     <script>
