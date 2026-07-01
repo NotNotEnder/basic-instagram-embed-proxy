@@ -664,11 +664,13 @@ function renderVideoEmbedPage(data, embedVideoUrl, options) {
     <meta property="og:video:width" content="${safeWidth}" />
     <meta property="og:video:height" content="${safeHeight}" />
     <meta property="og:image" content="${safeImage}" />
-    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:card" content="player" />
     <meta name="twitter:title" content="${safeTitle}" />
     <meta name="twitter:description" content="${safeDescription}" />
     <meta name="twitter:image" content="${safeImage}" />
-    <meta name="twitter:player" content="${safeVideo}" />
+    <meta name="twitter:player" content="${safePageUrl}" />
+    <meta name="twitter:player:stream" content="${safeVideo}" />
+    <meta name="twitter:player:stream:content_type" content="video/mp4" />
     <meta name="twitter:player:width" content="${safeWidth}" />
     <meta name="twitter:player:height" content="${safeHeight}" />
     <style>
@@ -835,6 +837,20 @@ app.get("/:type(reel|reels|p|tv)/:shortcode", async (req, res) => {
     const baseUrl = getPublicBaseUrl(req);
     const pageUrl = `${baseUrl}${req.originalUrl}`;
     const siteName = req.get("host") || new URL(baseUrl).host;
+
+    // Telegram renders an inline video player only when the *posted link itself*
+    // resolves to a raw video file. It won't pull video from an og:video meta
+    // sub-resource (that just yields an image-only card). So for Telegram's crawler
+    // specifically, redirect the page request straight to the proxied .mp4 — the
+    // same technique kkinstagram/InstaFix use. Other crawlers (Discord, etc.) keep
+    // getting the rich HTML embed below.
+    const userAgent = req.get("user-agent") || "";
+    const primaryVideo = data.mediaItems.find((item) => item.type === "video") || null;
+    if (primaryVideo && userAgent.toLowerCase().includes("telegrambot")) {
+      const telegramVideoUrl = `${baseUrl}/media/${encodeMediaUrl(primaryVideo.sourceUrl)}.mp4`;
+      return res.redirect(302, telegramVideoUrl);
+    }
+
     const isSingleVideo = data.mediaItems.length === 1 && data.mediaItems[0].type === "video";
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     res.setHeader("Cache-Control", "public, max-age=120");
@@ -881,6 +897,12 @@ async function handleMediaProxy(req, res) {
       return res.status(400).json({ ok: false, error: "Invalid media source URL" });
     }
 
+    // Stream the bytes through this domain rather than 302-redirecting to the CDN.
+    // Telegram validates an og:video URL by what it returns *directly*: a 302 to a
+    // third-party host responds with content-type text/plain, which Telegram reads
+    // as "not a video" and falls back to the og:image (image-only preview). Serving
+    // 200/206 video/mp4 with content-length here is what makes inline playback work
+    // (same pattern fxtwitter/vxtwitter use).
     const isVideoRequest = (req.params.ext || "").toLowerCase() === "mp4";
     const headers = {
       "User-Agent": BOT_UA,
